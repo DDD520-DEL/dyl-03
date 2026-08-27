@@ -24,23 +24,25 @@ func ValidateBatch(ids []string, limits BatchLimits) error {
 }
 
 // SubmitBatchDesired applies a desired-state patch to many devices
-// atomically: validation runs before any device is written.
+// atomically: every check (size, duplicates, device existence) runs before
+// any device is written, and the writes themselves are committed as a single
+// all-or-nothing batch so a mid-batch failure cannot leave some devices
+// updated and others untouched.
 func (s *Server) SubmitBatchDesired(ctx context.Context, ids []string, version int64, patch map[string]string) ([]*model.Shadow, error) {
-	var out []*model.Shadow
-	for _, id := range ids {
-		sh, err := s.shadows.UpdateDesired(id, version, patch)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, sh)
-	}
 	if err := ValidateBatch(ids, BatchLimits{MaxDevices: 500}); err != nil {
 		return nil, err
+	}
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			return nil, fmt.Errorf("duplicate device %s in batch", id)
+		}
+		seen[id] = struct{}{}
 	}
 	for _, id := range ids {
 		if s.devices.Get(id) == nil {
 			return nil, fmt.Errorf("device %s not found", id)
 		}
 	}
-	return out, nil
+	return s.shadows.UpdateDesiredBatch(ids, version, patch)
 }

@@ -81,6 +81,64 @@ func (s *Store) UpdateDesired(deviceID string, expectedVersion int64, patch map[
 	return sh.Clone(), nil
 }
 
+// UpdateDesiredBatch applies the same desired-state patch to every listed
+// device atomically. Each device's desired version must match expectedVersion;
+// if any device fails the version check or any write fails, no device is
+// mutated and the batch is fully rejected. This lets callers submit a batch
+// that is either entirely applied or entirely untouched.
+func (s *Store) UpdateDesiredBatch(ids []string, expectedVersion int64, patch map[string]string) ([]*model.Shadow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Stage every mutation against a private copy first, so a failure partway
+	// through the batch leaves the live shadows untouched.
+	type staged struct {
+		id      string
+		shadow  *model.Shadow
+		payload []byte
+	}
+	stagedWrites := make([]staged, 0, len(ids))
+	for _, id := range ids {
+		cur := s.shadows[id]
+		if cur == nil {
+			cur = &model.Shadow{DeviceID: id, Desired: map[string]string{}, Reported: map[string]string{}}
+		}
+		if cur.DesiredVer != expectedVersion {
+			return nil, fmt.Errorf("shadow desired version conflict for %s: have %d, want %d", id, cur.DesiredVer, expectedVersion)
+		}
+		next := cur.Clone()
+		for k, v := range patch {
+			next.Desired[k] = v
+		}
+		next.DesiredVer++
+		next.UpdatedAt = s.clock.Now()
+		payload, err := json.Marshal(next)
+		if err != nil {
+			return nil, fmt.Errorf("marshal shadow %s: %w", id, err)
+		}
+		stagedWrites = append(stagedWrites, staged{id: id, shadow: next, payload: payload})
+	}
+
+	// Durably persist every staged record before touching the live map, so a
+	// WAL failure cannot leave the in-memory shadows half written.
+	for _, w := range stagedWrites {
+		if err := s.wal.Append(wal.Record{Event: wal.EventWrite, Key: "shadow:" + w.id, Payload: w.payload}); err != nil {
+			return nil, fmt.Errorf("append wal for %s: %w", w.id, err)
+		}
+	}
+
+	// Commit the staged shadows to the live map and report the results.
+	out := make([]*model.Shadow, 0, len(stagedWrites))
+	for _, w := range stagedWrites {
+		s.shadows[w.id] = w.shadow.Clone()
+		if s.metrics != nil {
+			s.metrics.ShadowsUpdated.Add(1)
+		}
+		out = append(out, w.shadow.Clone())
+	}
+	return out, nil
+}
+
 // ApplyReported merges reported state and bumps the reported version.
 func (s *Store) ApplyReported(deviceID string, reported map[string]string) (*model.Shadow, error) {
 	s.mu.Lock()
