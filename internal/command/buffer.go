@@ -36,6 +36,10 @@ func (b *Buffer) Deliver(deviceID string) []*model.Command {
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Seq < out[j].Seq
 	})
+	// Remove the delivered entries so a subsequent call does not return the
+	// same commands again — each buffered command must be delivered exactly
+	// once after a reconnect.
+	delete(b.entries, deviceID)
 	return out
 }
 
