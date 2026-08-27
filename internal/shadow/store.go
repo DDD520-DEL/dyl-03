@@ -2,7 +2,6 @@ package shadow
 
 import (
 	"encoding/json"
-	"fmt"
 	"sync"
 
 	"github.com/dyl-03/shadow/internal/clock"
@@ -50,8 +49,12 @@ func (s *Store) Get(deviceID string) *model.Shadow {
 	return &model.Shadow{DeviceID: deviceID, Desired: map[string]string{}, Reported: map[string]string{}}
 }
 
-// UpdateDesired applies a desired-state change only when the caller's version
-// matches the current version, so concurrent writers cannot clobber each other.
+// UpdateDesired applies a desired-state change only when the caller's expected
+// version matches the shadow's current desired version. This is an
+// optimistic-concurrency check: a stale writer (one whose expectedVersion
+// predates an already-applied write) is rejected with ErrVersionConflict and
+// leaves the shadow and WAL untouched, so concurrent writers cannot clobber
+// each other. A zero expectedVersion matches an as-yet-unseen device.
 func (s *Store) UpdateDesired(deviceID string, expectedVersion int64, patch map[string]string) (*model.Shadow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -59,10 +62,13 @@ func (s *Store) UpdateDesired(deviceID string, expectedVersion int64, patch map[
 	if sh == nil {
 		sh = &model.Shadow{DeviceID: deviceID, Desired: map[string]string{}, Reported: map[string]string{}}
 	}
+	if expectedVersion != sh.DesiredVer {
+		return nil, ErrVersionConflict
+	}
 	for k, v := range patch {
 		sh.Desired[k] = v
 	}
-	sh.DesiredVer++
+	sh.DesiredVer = Bump(sh)
 	sh.UpdatedAt = s.clock.Now()
 	payload, err := json.Marshal(sh)
 	if err != nil {
