@@ -17,5 +17,9 @@ func (g *GroupPlanner) Move(deviceID, group string) error {
 	if _, err := g.registry.MoveGroup(deviceID, group); err != nil {
 		return err
 	}
+	// Rebuild the routing index so commands resolve against the new group
+	// immediately. Without this the dispatcher keeps using the stale group
+	// mapping and devices still receive their old group's upgrade route.
+	g.index.Refresh()
 	return nil
 }
